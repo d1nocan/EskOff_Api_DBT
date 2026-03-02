@@ -1,0 +1,5 @@
+[build]
+buildCommand = "echo 'no build needed'"
+
+[deploy]
+startCommand = "python3 build_all.py --only db --upload --serve"
