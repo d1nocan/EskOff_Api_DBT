@@ -47,16 +47,22 @@ Usage:
 
 import argparse
 import datetime
+import gc
 import hashlib
 import hmac
 import json
 import math
 import os
+import resource
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
+import xml.sax
+import xml.sax.handler
 import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -71,7 +77,7 @@ ESK_BBOX = (29.951658, 39.125883, 31.883232, 40.132722)
 CENTER_BBOX = (30.44765, 39.72707, 30.59102, 39.81402)
 
 DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-DEFAULT_API_URL  = "https://web-production-2a883c.up.railway.app/routes"
+DEFAULT_API_URL  = "https://web-production-2a883c.up.railway.app/data/routes.json"
 
 # Tile zoom config: (bbox, min_zoom, max_zoom)
 TILE_ZONES = [
@@ -277,18 +283,94 @@ def build_tiles_zip(output_dir, tile_url, parallel=4):
 #  PART 2: GEOMETRIES.DB (road graph)
 # ═════════════════════════════════════════════════════════════
 
-def download_overpass(osm_cache=None):
-    """Download highway data from Overpass API."""
+class _OSMSAXHandler(xml.sax.handler.ContentHandler):
+    """SAX handler: streams OSM XML, builds nodes dict + filtered ways list.
+
+    Memory-efficient: never holds the full XML document in memory.
+    Only retains the final nodes {} and ways [] structures.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.nodes = {}   # osm_id → (lat, lon)
+        self.ways = []    # list of (nids, hw_str, weight, is_oneway)
+        self._in_way = False
+        self._way_nids = []
+        self._way_tags = {}
+
+    def startElement(self, name, attrs):
+        if name == "node":
+            try:
+                lat = float(attrs["lat"])
+                lon = float(attrs["lon"])
+                if in_bbox(lat, lon):
+                    self.nodes[int(attrs["id"])] = (lat, lon)
+            except (KeyError, ValueError):
+                pass
+        elif name == "way":
+            self._in_way = True
+            self._way_nids = []
+            self._way_tags = {}
+        elif name == "nd" and self._in_way:
+            try:
+                self._way_nids.append(int(attrs["ref"]))
+            except (KeyError, ValueError):
+                pass
+        elif name == "tag" and self._in_way:
+            try:
+                self._way_tags[attrs["k"]] = attrs["v"]
+            except KeyError:
+                pass
+
+    def endElement(self, name):
+        if name != "way" or not self._in_way:
+            return
+        self._in_way = False
+        tags = self._way_tags
+        hw = tags.get("highway")
+        if hw not in HIGHWAY_WEIGHTS:
+            return
+        foot = tags.get("foot")
+        if foot == "no" and hw not in ("motorway", "motorway_link"):
+            return
+        if (tags.get("access") in BLOCKED_ACCESS and foot != "yes"
+                and hw not in ("motorway", "motorway_link")):
+            return
+        nids = self._way_nids
+        if len(nids) < 2:
+            return
+        if hw in ALWAYS_BIDI:
+            ow = False
+        elif hw in ("motorway", "motorway_link"):
+            ow = tags.get("oneway", "yes") == "yes"
+        else:
+            ow = tags.get("oneway", "no") == "yes"
+        self.ways.append((nids, hw, HIGHWAY_WEIGHTS[hw], ow))
+
+
+def download_and_parse_overpass(osm_cache=None):
+    """Download OSM XML and stream-parse with SAX (low memory).
+
+    Instead of loading the full JSON into memory (~200-400 MB Python dicts),
+    this streams the response to a temp file and SAX-parses it element by
+    element, keeping only the final nodes dict + filtered ways list (~60 MB).
+    """
     min_lon, min_lat, max_lon, max_lat = ESK_BBOX
     overpass_bbox = f"{min_lat},{min_lon},{max_lat},{max_lon}"
 
+    # ── Cache hit ──
     if osm_cache and Path(osm_cache).exists():
         print(f"  Cache: {osm_cache}")
-        with open(osm_cache, encoding="utf-8") as f:
-            return json.load(f)
+        handler = _OSMSAXHandler()
+        try:
+            xml.sax.parse(osm_cache, handler)
+            return handler.nodes, handler.ways
+        except xml.sax.SAXParseException:
+            print(f"  Cache XML degil, yeniden indiriliyor...")
 
+    # ── Download (XML format — no [out:json]) ──
     query = f"""
-[out:json][timeout:600];
+[timeout:600];
 way["highway"]({overpass_bbox});
 (._;>;);
 out body qt;
@@ -302,94 +384,84 @@ out body qt;
         url, data=post_data,
         headers={"User-Agent": "eskoff-geometry-builder/2.0"})
 
-    with urllib.request.urlopen(req, timeout=660) as resp:
-        total = int(resp.headers.get("Content-Length", 0))
-        chunks = []
-        dl = 0
-        while True:
-            chunk = resp.read(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            dl += len(chunk)
-            mb = dl / 1024 / 1024
-            if total:
-                print(f"\r  {mb:.1f}MB / {total / 1024 / 1024:.1f}MB "
-                      f"({dl / total * 100:.0f}%)  ", end="", flush=True)
-            else:
-                print(f"\r  {mb:.1f}MB...  ", end="", flush=True)
-        print()
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".osm")
+    try:
+        with urllib.request.urlopen(req, timeout=660) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            dl = 0
+            with os.fdopen(tmp_fd, "wb") as tmp:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    dl += len(chunk)
+                    mb = dl / 1024 / 1024
+                    if total:
+                        print(f"\r  {mb:.1f}MB / {total / 1024 / 1024:.1f}MB "
+                              f"({dl / total * 100:.0f}%)  ",
+                              end="", flush=True)
+                    else:
+                        print(f"\r  {mb:.1f}MB...  ", end="", flush=True)
+            print()
 
-    raw = b"".join(chunks)
-    data = json.loads(raw)
+        # Save to cache (copy temp file before parsing)
+        if osm_cache:
+            Path(osm_cache).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(tmp_path, osm_cache)
+            print(f"  Cache yazildi: {osm_cache}")
 
-    if osm_cache:
-        Path(osm_cache).parent.mkdir(parents=True, exist_ok=True)
-        with open(osm_cache, "w") as f:
-            json.dump(data, f)
-        print(f"  Cache yazildi: {osm_cache}")
-
-    return data
-
-
-def parse_overpass(osm_data):
-    """Parse Overpass JSON → (nodes, ways)."""
-    nodes = {}
-    ways = []
-    for elem in osm_data.get("elements", []):
-        t = elem.get("type")
-        if t == "node":
-            lat, lon = float(elem["lat"]), float(elem["lon"])
-            if in_bbox(lat, lon):
-                nodes[elem["id"]] = (lat, lon)
-        elif t == "way":
-            tags = elem.get("tags", {})
-            hw = tags.get("highway")
-            if hw not in HIGHWAY_WEIGHTS:
-                continue
-            foot = tags.get("foot")
-            if foot == "no" and hw not in ("motorway", "motorway_link"):
-                continue
-            if (tags.get("access") in BLOCKED_ACCESS and foot != "yes"
-                    and hw not in ("motorway", "motorway_link")):
-                continue
-            nids = elem.get("nodes", [])
-            if len(nids) < 2:
-                continue
-            if hw in ALWAYS_BIDI:
-                ow = False
-            elif hw in ("motorway", "motorway_link"):
-                ow = tags.get("oneway", "yes") == "yes"
-            else:
-                ow = tags.get("oneway", "no") == "yes"
-            ways.append((nids, hw, HIGHWAY_WEIGHTS[hw], ow))
-    return nodes, ways
+        # ── SAX parse (streaming, ~60 MB peak) ──
+        print(f"  XML parse ediliyor (SAX streaming)...")
+        handler = _OSMSAXHandler()
+        xml.sax.parse(tmp_path, handler)
+        return handler.nodes, handler.ways
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def build_graph(conn, nodes, ways):
-    """Build road graph with ID remapping."""
+    """Build road graph with ID remapping. Memory-optimized.
+
+    Optimizations vs original:
+    - No 'valid' dict copy — uses 'nodes' directly
+    - No 'nodes_data' list — writes to DB during remap loop
+    - Packed 'seen' set (single int) instead of tuple pairs (~75 MB savings)
+    - Stores penalty values (int) instead of highway strings (~20 MB savings)
+    """
     needed = set()
     for nids, _, _, _ in ways:
         needed.update(nids)
 
-    valid = {n: c for n, c in nodes.items() if n in needed}
-    print(f"  {len(valid):,} node, {len(ways):,} way")
-
-    # ID remap
+    # Remap IDs and write nodes directly to DB (no intermediate list)
     remap = {}
-    nodes_data = []
-    for lid, (oid, (lat, lon)) in enumerate(valid.items(), 1):
-        remap[oid] = lid
-        nodes_data.append((lid, lat, lon))
-
-    node_best_hw = {}
-
-    # Write nodes
+    lid = 0
+    batch = []
     conn.execute("BEGIN")
-    for i in range(0, len(nodes_data), 100_000):
-        conn.executemany("INSERT OR IGNORE INTO nodes VALUES(?,?,?)",
-                         nodes_data[i:i + 100_000])
+    for oid in needed:
+        coord = nodes.get(oid)
+        if coord is None:
+            continue
+        lid += 1
+        remap[oid] = lid
+        batch.append((lid, coord[0], coord[1]))
+        if len(batch) >= 100_000:
+            conn.executemany("INSERT OR IGNORE INTO nodes VALUES(?,?,?)", batch)
+            batch.clear()
+    if batch:
+        conn.executemany("INSERT OR IGNORE INTO nodes VALUES(?,?,?)", batch)
+        batch.clear()
     conn.execute("COMMIT")
+    del needed
+    gc.collect()
+
+    node_count = lid
+    print(f"  {node_count:,} node, {len(ways):,} way")
+
+    # Pack edge key into single int for compact seen-set
+    id_shift = max(20, node_count.bit_length())
+    node_best_penalty = {}   # remapped_id → int penalty value
 
     # Build edges
     seen = set()
@@ -398,33 +470,36 @@ def build_graph(conn, nodes, ways):
     conn.execute("BEGIN")
 
     for nids, hw, factor, is_ow in ways:
+        penalty = SNAP_PENALTY.get(hw, 99)
         for i in range(len(nids) - 1):
             a_osm, b_osm = nids[i], nids[i + 1]
             a, b = remap.get(a_osm), remap.get(b_osm)
             if a is None or b is None:
                 skipped += 1
                 continue
-            la, lo = valid[a_osm]
-            lb, lo2 = valid[b_osm]
+            la, lo = nodes[a_osm]
+            lb, lo2 = nodes[b_osm]
             dmm = hav_mm(la, lo, lb, lo2)
             wmm = int(dmm * factor)
 
-            penalty = SNAP_PENALTY.get(hw, 99)
             for n in (a, b):
-                cur = node_best_hw.get(n)
-                if cur is None or penalty < SNAP_PENALTY.get(cur, 99):
-                    node_best_hw[n] = hw
+                cur = node_best_penalty.get(n)
+                if cur is None or penalty < cur:
+                    node_best_penalty[n] = penalty
 
-            if (a, b) not in seen:
-                seen.add((a, b))
+            key_ab = (a << id_shift) | b
+            if key_ab not in seen:
+                seen.add(key_ab)
                 batch.append((a, b, dmm, wmm, 0))
             else:
                 dup += 1
-            if not is_ow and (b, a) not in seen:
-                seen.add((b, a))
-                batch.append((b, a, dmm, wmm, 0))
-            elif not is_ow:
-                dup += 1
+            if not is_ow:
+                key_ba = (b << id_shift) | a
+                if key_ba not in seen:
+                    seen.add(key_ba)
+                    batch.append((b, a, dmm, wmm, 0))
+                else:
+                    dup += 1
 
             if len(batch) >= 100_000:
                 conn.executemany(
@@ -437,12 +512,12 @@ def build_graph(conn, nodes, ways):
             "INSERT INTO edges(from_node,to_node,dist_mm,weight_mm,"
             "edge_type) VALUES(?,?,?,?,?)", batch)
     conn.execute("COMMIT")
-    del seen
+    del seen, batch
+    gc.collect()
 
-    nc = len(nodes_data)
     ec = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-    print(f"  {nc:,} node, {ec:,} edge yazildi")
-    return nc, ec, valid, remap, node_best_hw
+    print(f"  {node_count:,} node, {ec:,} edge yazildi")
+    return node_count, ec, remap, node_best_penalty
 
 
 def load_stops(routes_json=None, routes_url=None):
@@ -502,19 +577,21 @@ def load_stops(routes_json=None, routes_url=None):
     return stops
 
 
-def snap_stops(conn, stops, remap, valid_nodes, node_best_hw):
+def snap_stops(conn, stops, remap, nodes, node_best_penalty):
     """Snap stops to nearest graph nodes with road preference."""
     print(f"  {len(stops)} durak")
     spatial = defaultdict(list)
     graph_coords = {}
     for oid, lid in remap.items():
-        lat, lon = valid_nodes[oid]
+        coord = nodes.get(oid)
+        if coord is None:
+            continue
+        lat, lon = coord
         graph_coords[lid] = (lat, lon)
         spatial[(round(lat, 3), round(lon, 3))].append(lid)
 
     def penalty(nid):
-        hw = node_best_hw.get(nid)
-        return SNAP_PENALTY.get(hw, 30) if hw else 30
+        return node_best_penalty.get(nid, 30)
 
     conn.execute("BEGIN")
     conn.execute("DELETE FROM stop_nodes")
@@ -557,11 +634,10 @@ def build_geometries_db(output_dir, routes_json, routes_url, osm_cache):
     t0 = time.time()
     db_path = output_dir / "geometries.db"
 
-    # Download OSM data
+    # Download + parse OSM data (XML + SAX streaming — low memory)
     print("\n  [DB 1/3] OSM verisi indiriliyor...")
-    osm_data = download_overpass(osm_cache)
-    nodes, ways = parse_overpass(osm_data)
-    del osm_data
+    nodes, ways = download_and_parse_overpass(osm_cache)
+    gc.collect()
     print(f"  {len(nodes):,} node, {len(ways):,} way")
 
     # Build graph
@@ -572,21 +648,24 @@ def build_geometries_db(output_dir, routes_json, routes_url, osm_cache):
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-128000")
-    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-64000")
+    conn.execute("PRAGMA temp_store=FILE")
     conn.executescript(DB_SCHEMA)
 
-    nc, ec, valid, remap, nbh = build_graph(conn, nodes, ways)
-    del nodes, ways
+    nc, ec, remap, nbp = build_graph(conn, nodes, ways)
+    del ways
+    gc.collect()
 
     # Snap stops
     print("\n  [DB 3/3] Durak snap...")
     stops = load_stops(routes_json, routes_url)
     sc = 0
     if stops:
-        sc = snap_stops(conn, stops, remap, valid, nbh)
+        sc = snap_stops(conn, stops, remap, nodes, nbp)
     else:
         print("  Durak verisi bulunamadi.")
+    del nodes, remap, nbp
+    gc.collect()
 
     conn.executemany("INSERT OR REPLACE INTO metadata VALUES(?,?)", [
         ("built_at", datetime.datetime.now(datetime.timezone.utc).isoformat()),
@@ -605,7 +684,9 @@ def build_geometries_db(output_dir, routes_json, routes_url, osm_cache):
 
     db_size = db_path.stat().st_size
     mb = db_size / 1024 / 1024
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     print(f"\n  DB: {nc:,} node, {ec:,} edge, {sc:,} snap — {mb:.1f} MB")
+    print(f"  Peak RAM: {peak_mb:.0f} MB")
     print(f"  Sure: {fmt_dur(time.time() - t0)}")
     return nc, ec, sc, db_size
 
