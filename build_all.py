@@ -15,10 +15,13 @@ NO Flutter project dependencies. Does not touch assets/ or pubspec.yaml.
 Zero external dependencies — uses only Python 3.8+ stdlib.
 
 Usage:
-    # Build everything + start HTTP server:
-    python3 build_all.py --serve
+    # Build everything + upload to S3 bucket:
+    python3 build_all.py --upload
 
-    # Build only, no server:
+    # Build + upload + start HTTP server:
+    python3 build_all.py --upload --serve
+
+    # Build only, no upload or server:
     python3 build_all.py
 
     # Only tiles or db:
@@ -33,11 +36,19 @@ Usage:
 
     # Cache Overpass data (faster re-runs):
     python3 build_all.py --osm-cache /tmp/eskisehir_osm.json
+
+    Environment variables for S3 upload (--upload):
+      S3_ENDPOINT     — S3-compatible endpoint URL
+      S3_BUCKET       — Bucket name
+      S3_ACCESS_KEY   — Access Key ID
+      S3_SECRET_KEY   — Secret Access Key
+      S3_REGION       — Region (default: auto)
 """
 
 import argparse
 import datetime
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -624,6 +635,135 @@ def make_manifest(output_dir):
     return manifest
 
 
+# ═════════════════════════════════════════════════════════════
+#  PART 3: S3-COMPATIBLE BUCKET UPLOAD
+# ═════════════════════════════════════════════════════════════
+
+def _sign_key(key, date_stamp, region, service):
+    """Derive AWS Signature V4 signing key."""
+    k_date = hmac.new(("AWS4" + key).encode(), date_stamp.encode(), hashlib.sha256).digest()
+    k_region = hmac.new(k_date, region.encode(), hashlib.sha256).digest()
+    k_service = hmac.new(k_region, service.encode(), hashlib.sha256).digest()
+    return hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
+
+
+def s3_upload_file(file_path, object_key, endpoint, bucket, access_key,
+                   secret_key, region="auto"):
+    """Upload a file to S3-compatible bucket using AWS Signature V4."""
+    file_data = Path(file_path).read_bytes()
+    content_sha = hashlib.sha256(file_data).hexdigest()
+
+    # Parse endpoint
+    parsed = urllib.parse.urlparse(endpoint)
+    host = parsed.hostname
+    scheme = parsed.scheme
+    port_str = f":{parsed.port}" if parsed.port and parsed.port not in (80, 443) else ""
+    host_header = f"{host}{port_str}"
+
+    # Determine content type
+    ext = Path(object_key).suffix.lower()
+    content_types = {
+        ".json": "application/json",
+        ".db": "application/octet-stream",
+        ".zip": "application/zip",
+    }
+    content_type = content_types.get(ext, "application/octet-stream")
+
+    # Timestamps
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+
+    # Canonical request
+    uri = f"/{bucket}/{object_key}"
+    canonical_qs = ""
+    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+    canonical_headers = (
+        f"content-type:{content_type}\n"
+        f"host:{host_header}\n"
+        f"x-amz-content-sha256:{content_sha}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    canonical_request = (
+        f"PUT\n{uri}\n{canonical_qs}\n{canonical_headers}\n"
+        f"{signed_headers}\n{content_sha}"
+    )
+
+    # String to sign
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    canon_hash = hashlib.sha256(canonical_request.encode()).hexdigest()
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{canon_hash}"
+
+    # Signature
+    signing_key = _sign_key(secret_key, date_stamp, region, "s3")
+    signature = hmac.new(signing_key, string_to_sign.encode(),
+                         hashlib.sha256).hexdigest()
+
+    auth = (f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}")
+
+    url = f"{scheme}://{host_header}{uri}"
+    req = urllib.request.Request(url, data=file_data, method="PUT")
+    req.add_header("Content-Type", content_type)
+    req.add_header("Host", host_header)
+    req.add_header("x-amz-content-sha256", content_sha)
+    req.add_header("x-amz-date", amz_date)
+    req.add_header("Authorization", auth)
+    req.add_header("x-amz-acl", "public-read")
+
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        return resp.status
+
+
+def upload_to_bucket(output_dir):
+    """Upload all output files to S3-compatible bucket.
+
+    Reads credentials from environment variables:
+      S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY, S3_REGION
+    """
+    endpoint = os.environ.get("S3_ENDPOINT", "").rstrip("/")
+    bucket = os.environ.get("S3_BUCKET", "")
+    access_key = os.environ.get("S3_ACCESS_KEY", "")
+    secret_key = os.environ.get("S3_SECRET_KEY", "")
+    region = os.environ.get("S3_REGION", "auto")
+
+    if not all([endpoint, bucket, access_key, secret_key]):
+        print("  HATA: S3 env degiskenleri eksik!")
+        print("  Gerekli: S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY")
+        return False
+
+    print(f"\n{'─' * 50}")
+    print(f"  BUCKET UPLOAD")
+    print(f"{'─' * 50}")
+    print(f"  Endpoint: {endpoint}")
+    print(f"  Bucket:   {bucket}")
+    print(f"  Region:   {region}")
+
+    files = [f for f in sorted(output_dir.iterdir()) if f.is_file()]
+    ok = fail = 0
+
+    for f in files:
+        size = f.stat().st_size
+        print(f"  Yukleniyor: {f.name} ({fmt_size(size)})...", end=" ", flush=True)
+        try:
+            status = s3_upload_file(
+                f, f.name, endpoint, bucket, access_key, secret_key, region)
+            print(f"OK ({status})")
+            ok += 1
+        except Exception as e:
+            print(f"HATA: {e}")
+            fail += 1
+
+    print(f"\n  Upload: {ok} basarili, {fail} basarisiz")
+    if ok > 0:
+        print(f"  URL ornegi: {endpoint}/{bucket}/{files[0].name}")
+    return fail == 0
+
+
+# ═════════════════════════════════════════════════════════════
+#  PART 4: MANIFEST + HTTP SERVER
+# ═════════════════════════════════════════════════════════════
+
 class CORSHandler(SimpleHTTPRequestHandler):
     """HTTP handler with CORS headers for cross-origin app access."""
 
@@ -689,6 +829,8 @@ def main():
                         help="URL to fetch routes from")
     parser.add_argument("--osm-cache", default=None,
                         help="Cache Overpass JSON for faster re-runs")
+    parser.add_argument("--upload", action="store_true",
+                        help="Upload output files to S3 bucket (needs S3_* env vars)")
     parser.add_argument("--serve", action="store_true",
                         help="Start HTTP server after build")
     parser.add_argument("--serve-only", action="store_true",
@@ -752,6 +894,10 @@ def main():
     print(f"  Toplam:         {fmt_size(total_size)}")
     print(f"  Cikti:          {output_dir}")
     print(f"{'=' * 58}")
+
+    # ── Upload ──
+    if args.upload:
+        upload_to_bucket(output_dir)
 
     # ── Serve ──
     if args.serve:
