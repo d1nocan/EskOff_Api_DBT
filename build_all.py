@@ -55,6 +55,7 @@ import math
 import os
 import resource
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -376,21 +377,38 @@ way["highway"]({overpass_bbox});
 out body qt;
 """.strip()
 
-    url = "https://overpass-api.de/api/interpreter"
+    overpass_urls = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    ]
     post_data = urllib.parse.urlencode({"data": query}).encode()
-    print(f"  Overpass API'den indiriliyor (BBOX: {overpass_bbox})...")
-
-    req = urllib.request.Request(
-        url, data=post_data,
-        headers={"User-Agent": "eskoff-geometry-builder/2.0"})
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".osm")
-    try:
-        with urllib.request.urlopen(req, timeout=660) as resp:
+    os.close(tmp_fd)  # we'll reopen per attempt
+
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        api_url = overpass_urls[(attempt - 1) % len(overpass_urls)]
+        print(f"  [{attempt}/{max_retries}] Indiriliyor: {api_url.split('//')[1].split('/')[0]}...")
+        try:
+            req = urllib.request.Request(
+                api_url, data=post_data,
+                headers={"User-Agent": "eskoff-geometry-builder/2.0"})
+
+            # Per-read timeout via default socket timeout (restored after)
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(120)  # 120s per read op
+            try:
+                resp = urllib.request.urlopen(req, timeout=660)
+            finally:
+                socket.setdefaulttimeout(old_timeout)
+
             total = int(resp.headers.get("Content-Length", 0))
             dl = 0
-            with os.fdopen(tmp_fd, "wb") as tmp:
+            with open(tmp_path, "wb") as tmp:
                 while True:
+                    # Each read() inherits socket timeout from connection
                     chunk = resp.read(65536)
                     if not chunk:
                         break
@@ -398,13 +416,36 @@ out body qt;
                     dl += len(chunk)
                     mb = dl / 1024 / 1024
                     if total:
-                        print(f"\r  {mb:.1f}MB / {total / 1024 / 1024:.1f}MB "
-                              f"({dl / total * 100:.0f}%)  ",
+                        print(f"\r  {mb:.1f}MB / {total/1024/1024:.1f}MB "
+                              f"({dl/total*100:.0f}%)  ",
                               end="", flush=True)
                     else:
                         print(f"\r  {mb:.1f}MB...  ", end="", flush=True)
+            resp.close()
             print()
 
+            # Verify XML completeness: must end with </osm>
+            with open(tmp_path, "rb") as f:
+                f.seek(max(0, os.path.getsize(tmp_path) - 128))
+                tail = f.read()
+            if b"</osm>" not in tail:
+                raise ValueError(
+                    f"Eksik XML ({dl/1024/1024:.1f}MB) — </osm> bulunamadi")
+
+            print(f"  Indirme tamam: {dl/1024/1024:.1f}MB")
+            break  # success
+
+        except Exception as e:
+            print(f"\n  Deneme {attempt} basarisiz: {e}")
+            if attempt < max_retries:
+                wait = 15 * attempt
+                print(f"  {wait}s beklenip tekrar denenecek...")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(
+                    f"Overpass indirmesi {max_retries} denemede basarisiz") from e
+
+    try:
         # Save to cache (copy temp file before parsing)
         if osm_cache:
             Path(osm_cache).parent.mkdir(parents=True, exist_ok=True)
