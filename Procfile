@@ -1,1 +1,1 @@
-webdbt: python3 build_all.py --serve
+web: python3 build_all.py --only db --serve
