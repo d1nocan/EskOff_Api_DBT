@@ -799,10 +799,11 @@ def s3_upload_file(file_path, object_key, endpoint, bucket, access_key,
     # Canonical request
     uri = f"/{bucket}/{object_key}"
     canonical_qs = ""
-    signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+    signed_headers = "content-type;host;x-amz-acl;x-amz-content-sha256;x-amz-date"
     canonical_headers = (
         f"content-type:{content_type}\n"
         f"host:{host_header}\n"
+        f"x-amz-acl:public-read\n"
         f"x-amz-content-sha256:{content_sha}\n"
         f"x-amz-date:{amz_date}\n"
     )
@@ -883,24 +884,152 @@ def upload_to_bucket(output_dir):
 
 
 # ═════════════════════════════════════════════════════════════
-#  PART 4: MANIFEST + HTTP SERVER
+#  PART 4: MANIFEST + HTTP SERVER + SYNC API
 # ═════════════════════════════════════════════════════════════
 
+# Global sync state — accessed by handler threads
+_sync_state = {
+    "running": False,
+    "last_sync": None,
+    "last_status": None,   # "ok" | "error"
+    "last_error": None,
+    "last_duration": None,
+    "started_at": None,
+    "phase": None,          # "db", "tiles", "upload", "done"
+}
+_sync_lock = Lock()
+
+# Build config — set once in main(), read by sync handler
+_build_cfg = {
+    "output_dir": None,
+    "tile_url": DEFAULT_TILE_URL,
+    "parallel": 4,
+    "routes_json": None,
+    "routes_url": None,
+    "osm_cache": None,
+    "upload": False,
+}
+
+
+def _run_sync(target="all"):
+    """Run a full or partial rebuild. Called from /sync endpoint thread."""
+    with _sync_lock:
+        if _sync_state["running"]:
+            return
+        _sync_state["running"] = True
+        _sync_state["started_at"] = datetime.datetime.now(
+            datetime.timezone.utc).isoformat()
+        _sync_state["phase"] = "starting"
+        _sync_state["last_error"] = None
+
+    cfg = _build_cfg
+    output_dir = cfg["output_dir"]
+    t0 = time.time()
+
+    try:
+        if target in ("all", "tiles"):
+            _sync_state["phase"] = "tiles"
+            build_tiles_zip(output_dir, cfg["tile_url"], cfg["parallel"])
+
+        if target in ("all", "db"):
+            _sync_state["phase"] = "db"
+            build_geometries_db(
+                output_dir, cfg["routes_json"],
+                cfg["routes_url"], cfg["osm_cache"])
+
+        _sync_state["phase"] = "manifest"
+        make_manifest(output_dir)
+
+        if cfg["upload"]:
+            _sync_state["phase"] = "upload"
+            upload_to_bucket(output_dir)
+
+        elapsed = time.time() - t0
+        with _sync_lock:
+            _sync_state["last_sync"] = datetime.datetime.now(
+                datetime.timezone.utc).isoformat()
+            _sync_state["last_status"] = "ok"
+            _sync_state["last_duration"] = f"{elapsed:.0f}s"
+            _sync_state["phase"] = "done"
+        print(f"\n  [SYNC] Tamamlandi — {fmt_dur(elapsed)}")
+
+    except Exception as e:
+        with _sync_lock:
+            _sync_state["last_status"] = "error"
+            _sync_state["last_error"] = str(e)
+            _sync_state["phase"] = "error"
+        print(f"\n  [SYNC] Hata: {e}")
+
+    finally:
+        with _sync_lock:
+            _sync_state["running"] = False
+
+
 class CORSHandler(SimpleHTTPRequestHandler):
-    """HTTP handler with CORS headers for cross-origin app access."""
+    """HTTP handler with CORS headers and /sync API."""
 
     def __init__(self, *args, directory=None, **kwargs):
         super().__init__(*args, directory=directory, **kwargs)
 
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods",
+                         "GET, POST, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
         super().end_headers()
 
     def do_OPTIONS(self):
         self.send_response(200)
         self.end_headers()
+
+    def _json_response(self, code, data):
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.rstrip("/")
+
+        # GET /sync/status — check sync state
+        if path == "/sync/status":
+            self._json_response(200, _sync_state)
+            return
+
+        # Fallback to file serving
+        super().do_GET()
+
+    def do_POST(self):
+        path = self.path.rstrip("/")
+
+        # POST /sync — rebuild all (db + tiles)
+        # POST /sync/db — rebuild only db
+        # POST /sync/tiles — rebuild only tiles
+        if path in ("/sync", "/sync/db", "/sync/tiles"):
+            if _sync_state["running"]:
+                self._json_response(409, {
+                    "error": "Sync zaten calisiyor",
+                    "phase": _sync_state["phase"],
+                    "started_at": _sync_state["started_at"],
+                })
+                return
+
+            target = "all"
+            if path == "/sync/db":
+                target = "db"
+            elif path == "/sync/tiles":
+                target = "tiles"
+
+            Thread(target=_run_sync, args=(target,), daemon=True).start()
+            self._json_response(202, {
+                "message": f"Sync baslatildi (hedef: {target})",
+                "status_url": "/sync/status",
+            })
+            return
+
+        self._json_response(404, {"error": "Not found"})
 
     def log_message(self, format, *args):
         print(f"  [{self.log_date_time_string()}] {format % args}")
@@ -964,6 +1093,15 @@ def main():
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Store build config for /sync API ──
+    _build_cfg["output_dir"] = output_dir
+    _build_cfg["tile_url"] = args.tile_url
+    _build_cfg["parallel"] = args.parallel
+    _build_cfg["routes_json"] = args.routes_json
+    _build_cfg["routes_url"] = args.routes_url
+    _build_cfg["osm_cache"] = args.osm_cache
+    _build_cfg["upload"] = args.upload
 
     # ── Serve only mode ──
     if args.serve_only:
