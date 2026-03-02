@@ -69,7 +69,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 
 # ─── Constants ───────────────────────────────────────────────
 # Eskişehir bounding box: (min_lon, min_lat, max_lon, max_lat)
@@ -974,6 +974,15 @@ def main():
         serve_files(output_dir, args.port)
         return
 
+    # ── If --serve, start HTTP server immediately so Railway sees the port ──
+    if args.serve:
+        serve_dir = str(output_dir)
+        handler = lambda *a, **kw: CORSHandler(*a, directory=serve_dir, **kw)
+        server = HTTPServer(("0.0.0.0", args.port), handler)
+        srv_thread = Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+        print(f"  HTTP Server baslatildi (port {args.port}) — build arka planda baslayacak")
+
     # ── Build mode ──
     print("=" * 58)
     print("  eskoff Asset Builder v2.0")
@@ -1021,9 +1030,15 @@ def main():
     if args.upload:
         upload_to_bucket(output_dir)
 
-    # ── Serve ──
+    # ── Serve (block main thread if server is running) ──
     if args.serve:
-        serve_files(output_dir, args.port)
+        print(f"\n  HTTP Server dinliyor: 0.0.0.0:{args.port}")
+        print(f"  Ctrl+C ile durdur\n")
+        try:
+            srv_thread.join()
+        except KeyboardInterrupt:
+            print("\n  Server durduruluyor...")
+            server.shutdown()
 
 
 if __name__ == "__main__":
