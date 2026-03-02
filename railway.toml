@@ -3,7 +3,7 @@ builder = "railpack"
 buildCommand = "echo 'no build needed'"
 
 [deploy]
-startCommand = "python3 build_all.py --only db --upload --serve"
+startCommand = "python3 build_all.py --upload --serve"
 healthcheckPath = "/"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
