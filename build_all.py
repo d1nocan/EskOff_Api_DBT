@@ -1131,42 +1131,75 @@ def main():
 
     t0 = time.time()
 
-    # ── Tiles → ZIP ──
-    tile_count = 0
-    tile_size = 0
-    if args.only != "db":
-        tile_count, tile_size = build_tiles_zip(
-            output_dir, args.tile_url, args.parallel)
+    # Mark sync state so /sync/status reflects the initial build
+    with _sync_lock:
+        _sync_state["running"] = True
+        _sync_state["started_at"] = datetime.datetime.now(
+            datetime.timezone.utc).isoformat()
+        _sync_state["phase"] = "starting"
+        _sync_state["last_error"] = None
 
-    # ── geometries.db ──
-    nc = ec = sc = 0
-    db_size = 0
-    if args.only != "tiles":
-        nc, ec, sc, db_size = build_geometries_db(
-            output_dir, args.routes_json, args.routes_url, args.osm_cache)
+    try:
+        # ── Tiles → ZIP ──
+        tile_count = 0
+        tile_size = 0
+        if args.only != "db":
+            _sync_state["phase"] = "tiles"
+            tile_count, tile_size = build_tiles_zip(
+                output_dir, args.tile_url, args.parallel)
 
-    # ── Manifest ──
-    print(f"\n  Manifest olusturuluyor...")
-    make_manifest(output_dir)
+        # ── geometries.db ──
+        nc = ec = sc = 0
+        db_size = 0
+        if args.only != "tiles":
+            _sync_state["phase"] = "db"
+            nc, ec, sc, db_size = build_geometries_db(
+                output_dir, args.routes_json, args.routes_url, args.osm_cache)
 
-    # ── Summary ──
-    total_size = tile_size + db_size
-    elapsed = time.time() - t0
+        # ── Manifest ──
+        print(f"\n  Manifest olusturuluyor...")
+        _sync_state["phase"] = "manifest"
+        make_manifest(output_dir)
 
-    print(f"\n{'=' * 58}")
-    print(f"  TAMAMLANDI — {fmt_dur(elapsed)}")
-    print(f"{'─' * 58}")
-    if args.only != "db":
-        print(f"  tiles.zip:      {tile_count:,} tile ({fmt_size(tile_size)})")
-    if args.only != "tiles":
-        print(f"  geometries.db:  {nc:,} node, {ec:,} edge, {sc:,} snap ({fmt_size(db_size)})")
-    print(f"  Toplam:         {fmt_size(total_size)}")
-    print(f"  Cikti:          {output_dir}")
-    print(f"{'=' * 58}")
+        # ── Summary ──
+        total_size = tile_size + db_size
+        elapsed = time.time() - t0
 
-    # ── Upload ──
-    if args.upload:
-        upload_to_bucket(output_dir)
+        print(f"\n{'=' * 58}")
+        print(f"  TAMAMLANDI — {fmt_dur(elapsed)}")
+        print(f"{'─' * 58}")
+        if args.only != "db":
+            print(f"  tiles.zip:      {tile_count:,} tile ({fmt_size(tile_size)})")
+        if args.only != "tiles":
+            print(f"  geometries.db:  {nc:,} node, {ec:,} edge, {sc:,} snap ({fmt_size(db_size)})")
+        print(f"  Toplam:         {fmt_size(total_size)}")
+        print(f"  Cikti:          {output_dir}")
+        print(f"{'=' * 58}")
+
+        # ── Upload ──
+        if args.upload:
+            _sync_state["phase"] = "upload"
+            upload_to_bucket(output_dir)
+
+        # Finalize sync state for the initial build
+        with _sync_lock:
+            _sync_state["last_sync"] = datetime.datetime.now(
+                datetime.timezone.utc).isoformat()
+            _sync_state["last_status"] = "ok"
+            _sync_state["last_duration"] = f"{elapsed:.0f}s"
+            _sync_state["phase"] = "done"
+
+    except Exception as e:
+        with _sync_lock:
+            _sync_state["last_status"] = "error"
+            _sync_state["last_error"] = str(e)
+            _sync_state["phase"] = "error"
+        print(f"\n  [BUILD] Hata: {e}")
+        raise
+
+    finally:
+        with _sync_lock:
+            _sync_state["running"] = False
 
     # ── Serve (block main thread if server is running) ──
     if args.serve:
